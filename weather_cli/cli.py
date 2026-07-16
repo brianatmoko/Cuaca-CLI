@@ -9,9 +9,19 @@ from .api import fetch_weather, fetch_aqi, parse_current, parse_daily, parse_hou
 from .models import WeatherReport, City
 from .formatter import format_report, format_comparison, format_json, format_csv
 from .geoip import detect_city
+from .cache import cache_cleanup, cache_stats
+from .errors import APIError, CityNotFoundError, NetworkError, WeatherError, ERROR_MESSAGES
+
+VERBOSE = False
+
+
+def log(msg: str):
+    if VERBOSE:
+        print(f"  [debug] {msg}", file=sys.stderr)
 
 
 def _resolve_city(query: str, config: dict) -> City | None:
+    log(f"Resolving city: {query}")
     results = resolve(query)
     if not results:
         return None
@@ -32,19 +42,22 @@ def _get_city(args, config: dict) -> City | None:
         return _resolve_city(args.city, config)
     favs = load_favorites()
     if favs:
+        log(f"Using favorite: {favs[0]}")
         return _resolve_city(favs[0], config)
     geo = detect_city()
     if geo:
+        log(f"GeoIP detected: {geo.name}")
         return geo
     return _resolve_city(config.get("default_city", "Jakarta"), config)
 
 
 def main() -> int:
+    global VERBOSE
     config = load_config()
 
     parser = argparse.ArgumentParser(
         prog="weather",
-        description="🌤️  Cek cuaca Indonesia dari terminal",
+        description="Cek cuaca Indonesia dari terminal",
         epilog="Contoh: weather Bandung --forecast 5 --aqi",
     )
     parser.add_argument("city", nargs="?", help="Nama kota")
@@ -60,12 +73,25 @@ def main() -> int:
     parser.add_argument("--config", nargs=1, metavar="KEY=VAL",
                         help="Set konfigurasi (contoh: default_city=Bandung)")
     parser.add_argument("--no-color", action="store_true", help="Nonaktifkan warna")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Tampilkan debug log")
     parser.add_argument("--version", action="store_true", help="Tampilkan versi")
+    parser.add_argument("--cache-cleanup", action="store_true",
+                        help="Bersihkan cache (hapus file >24 jam)")
 
     args = parser.parse_args()
 
+    if args.verbose:
+        VERBOSE = True
+
     if args.version:
         print(f"weather-cli v{__version__}")
+        return 0
+
+    if args.cache_cleanup:
+        removed = cache_cleanup()
+        stats = cache_stats()
+        print(f"  Cache dibersihkan: {removed} file dihapus")
+        print(f"  Cache saat ini: {stats['files']} file ({stats['size_kb']} KB)")
         return 0
 
     if args.config:
@@ -74,9 +100,9 @@ def main() -> int:
             key, val = kv.split("=", 1)
             config[key] = val
             save_config(config)
-            print(f"  ✅ Konfigurasi {key} = {val} disimpan")
+            print(f"  Konfigurasi {key} = {val} disimpan")
             return 0
-        print("  ❌ Format: --config key=value")
+        print("  Format: --config key=value")
         return 1
 
     if args.favorites:
@@ -84,9 +110,9 @@ def main() -> int:
         if not favs:
             print("  Belum ada kota favorit. Gunakan --save untuk menambahkan.")
             return 0
-        print(f"\n  {os.path.basename('⭐ Kota Favorit')}")
+        print(f"\n  Kota Favorit")
         for f in favs:
-            print(f"    • {f}")
+            print(f"    \u2022 {f}")
         print()
         return 0
 
@@ -94,61 +120,84 @@ def main() -> int:
     if forecast_days == 0:
         forecast_days = config.get("forecast_days", 3)
 
-    if args.compare:
-        cities = []
-        for q in [args.city] + args.compare:
-            if not q:
-                continue
-            c = _resolve_city(q, config)
-            if c:
-                cities.append(c)
-        if len(cities) < 2:
-            print("  ❌ Minimal 2 kota untuk perbandingan")
+    try:
+        if args.compare:
+            return _handle_compare(args, config)
+
+        city = _get_city(args, config)
+        if not city:
+            msg = ERROR_MESSAGES["city"]
+            print(f"  Kota '{args.city or config['default_city']}' tidak ditemukan")
             return 1
-        reports = []
-        for c in cities:
-            raw = fetch_weather(c, 1)
-            current = parse_current(raw)
-            reports.append(WeatherReport(city=c, current=current))
-        print(format_comparison(reports, no_color=args.no_color))
+
+        if args.save:
+            favs = load_favorites()
+            if city.name not in favs:
+                favs.append(city.name)
+                save_favorites(favs)
+                print(f"  {city.name} ditambahkan ke favorit!")
+            else:
+                print(f"  {city.name} sudah ada di favorit")
+            return 0
+
+        raw = fetch_weather(city, forecast_days, hourly=args.hourly)
+        log(f"Weather data received for {city.name}")
+        current = parse_current(raw)
+        daily = parse_daily(raw)
+        hourly = parse_hourly(raw) if args.hourly else []
+        aqi = parse_aqi(fetch_aqi(city)) if args.aqi else None
+
+        report = WeatherReport(
+            city=city,
+            current=current,
+            daily=daily,
+            hourly=hourly,
+            aqi=aqi,
+        )
+
+        if args.export == "json":
+            print(format_json(report))
+        elif args.export == "csv":
+            print(format_csv(report))
+        else:
+            print(format_report(report, show_hourly=args.hourly, no_color=args.no_color))
+
         return 0
 
-    city = _get_city(args, config)
-    if not city:
-        print(f"  ❌ Kota '{args.city or config['default_city']}' tidak ditemukan")
+    except NetworkError:
+        print(f"\n  {ERROR_MESSAGES['connection']}\n")
+        return 1
+    except APIError as e:
+        print(f"\n  Gagal mengambil data cuaca.")
+        if VERBOSE:
+            print(f"  {e}")
+        print(f"  Coba lagi dalam beberapa saat.\n")
+        return 1
+    except WeatherError as e:
+        print(f"\n  Error: {e}\n")
         return 1
 
-    if args.save:
-        favs = load_favorites()
-        if city.name not in favs:
-            favs.append(city.name)
-            save_favorites(favs)
-            print(f"  ⭐ {city.name} ditambahkan ke favorit!")
+
+def _handle_compare(args, config: dict) -> int:
+    cities = []
+    for q in [args.city] + args.compare:
+        if not q:
+            continue
+        c = _resolve_city(q, config)
+        if c:
+            cities.append(c)
         else:
-            print(f"  {city.name} sudah ada di favorit")
-        return 0
-
-    raw = fetch_weather(city, forecast_days, hourly=args.hourly)
-    current = parse_current(raw)
-    daily = parse_daily(raw)
-    hourly = parse_hourly(raw) if args.hourly else []
-    aqi = parse_aqi(fetch_aqi(city)) if args.aqi else None
-
-    report = WeatherReport(
-        city=city,
-        current=current,
-        daily=daily,
-        hourly=hourly,
-        aqi=aqi,
-    )
-
-    if args.export == "json":
-        print(format_json(report))
-    elif args.export == "csv":
-        print(format_csv(report))
-    else:
-        print(format_report(report, show_hourly=args.hourly, no_color=args.no_color))
-
+            print(f"  Kota '{q}' tidak ditemukan")
+            return 1
+    if len(cities) < 2:
+        print("  Minimal 2 kota untuk perbandingan")
+        return 1
+    reports = []
+    for c in cities:
+        raw = fetch_weather(c, 1)
+        current = parse_current(raw)
+        reports.append(WeatherReport(city=c, current=current))
+    print(format_comparison(reports, no_color=args.no_color))
     return 0
 
 

@@ -2,7 +2,7 @@ import json
 import urllib.request
 from .models import City
 
-IPAPI = "http://ip-api.com/json/?fields=city,lat,lon,countryCode"
+IPAPI = "https://ip-api.com/json/?fields=city,lat,lon,countryCode"
 
 
 def detect_city() -> City | None:
